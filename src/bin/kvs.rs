@@ -1,3 +1,5 @@
+use std::env::temp_dir;
+
 use clap::{Parser, Subcommand};
 use kvs::KvStore;
 
@@ -23,24 +25,27 @@ enum Commands {
         key: String,
     },
 }
-fn main() {
+fn main() -> kvs::Result<()> {
     let cli = Cli::parse();
-    let mut kvs = KvStore::new();
+    let mut kvs = KvStore::open("./")?;
     match cli.command {
         Commands::Get { key } => {
-            eprintln!("unimplemented!");
-            unimplemented!()
-            // println!("{:?}", kvs.get(key));
+            if let Some(value) = kvs.get(key)? {
+                println!("{value}");
+            } else {
+                println!("Key not found");
+            }
         }
         Commands::Set { key, value } => {
-            eprintln!("unimplemented!");
-            unimplemented!()
-            // kvs.set(key, value);
+            kvs.set(key, value)?;
         }
         Commands::Remove { key } => {
-            eprintln!("unimplemented!");
-            unimplemented!();
-            // kvs.remove(key);
+            let result = kvs.remove(key);
+            if result.is_err() {
+                println!("Key not found");
+                return result;
+            }
         }
     }
+    Ok(())
 }
