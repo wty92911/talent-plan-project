@@ -20,10 +20,14 @@ pub enum KvsError {
     SerdeError(#[from] serde_json::Error),
 
     /// Remove a non existent key
-    #[error("the key {0} is not existent")]
+    #[error("Key not found")]
     NonExistentKey(String),
 
     /// Deserializing Error
     #[error("error when deserialize from files")]
     DeserializeError,
+
+    /// Response error
+    #[error("response error: {0}")]
+    ResponseError(String),
 }

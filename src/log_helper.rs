@@ -2,7 +2,7 @@ use crate::KvsError;
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Debug)]

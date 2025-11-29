@@ -23,6 +23,8 @@ use walkdir::WalkDir;
 mod log_helper;
 use log_helper::{LogHelper, Record};
 
+pub mod protocol;
+
 use crate::log_helper::FileIndex;
 
 const MAX_LOG_SIZE: u64 = 1 << 20;
