@@ -47,7 +47,7 @@ fn send_request_and_get_response(
     request: Request,
     buf_writer: &mut BufWriter<TcpStream>,
     buf_reader: &mut BufReader<TcpStream>,
-) -> kvs::Result<Response> {
+) -> kvs::error::Result<Response> {
     serde_json::to_writer(&mut *buf_writer, &request)?;
     buf_writer.flush()?;
     let deserializer = Deserializer::from_reader(buf_reader);
@@ -55,7 +55,7 @@ fn send_request_and_get_response(
     Ok(response)
 }
 
-fn main() -> kvs::Result<()> {
+fn main() -> kvs::error::Result<()> {
     let cli = Cli::parse();
 
     // 从命令中提取地址
@@ -95,7 +95,7 @@ fn main() -> kvs::Result<()> {
             // Set 和 Remove 操作成功，无需输出
         }
         Response::Err(e) => {
-            return Err(kvs::KvsError::ResponseError(e));
+            return Err(kvs::error::KvsError::ResponseError(e));
         }
     }
     Ok(())

@@ -1,4 +1,4 @@
-use crate::KvsError;
+use crate::error::KvsError;
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::fs::File;

@@ -235,7 +235,6 @@ fn cli_access_server(engine: &str, addr: &str) {
         .success()
         .stdout(is_empty());
 
-    println!("get key1");
     Command::cargo_bin("kvs-client")
         .unwrap()
         .args(&["get", "key1", "--addr", addr])

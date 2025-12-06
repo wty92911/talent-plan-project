@@ -1,18 +1,24 @@
 use std::{
     fs,
     io::{BufReader, BufWriter, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use anyhow::{Error, Result};
 use clap::Parser;
 use kvs::{
-    KvStore,
+    KvStore, SledEngine,
+    engine::KvsEngine,
     protocol::{Request, Response},
+    thread_pool::{NaiveThreadPool, ThreadPool},
 };
 use serde_json::Deserializer;
-use sled::Tree;
 #[derive(Parser)]
 #[command(author, version)]
 struct Args {
@@ -20,11 +26,6 @@ struct Args {
     addr: String,
     #[arg(short, long, default_value = "kvs")]
     engine: String,
-}
-trait Engine {
-    fn set(&mut self, key: String, value: String) -> Result<()>;
-    fn get(&self, key: String) -> Result<Option<String>>;
-    fn remove(&mut self, key: String) -> Result<()>;
 }
 
 /// 检查数据目录中之前使用的引擎
@@ -62,47 +63,6 @@ fn detect_previous_engine(path: &Path) -> Result<Option<String>> {
     }
 }
 
-impl Engine for sled::Db {
-    fn set(&mut self, key: String, value: String) -> Result<()> {
-        Tree::insert(self, key.as_str(), value.as_str())?;
-        self.flush()?;
-        Ok(())
-    }
-    fn get(&self, key: String) -> Result<Option<String>> {
-        match Tree::get(self, key) {
-            Ok(Some(v)) => Ok(Some(String::from_utf8(v.to_vec())?)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn remove(&mut self, key: String) -> Result<()> {
-        let result = Tree::remove(self, key)?;
-        if result.is_none() {
-            Err(Error::msg("Key not found"))
-        } else {
-            self.flush()?;
-            Ok(())
-        }
-    }
-}
-
-impl Engine for KvStore {
-    fn set(&mut self, key: String, value: String) -> Result<()> {
-        self.set(key, value)?;
-        Ok(())
-    }
-
-    fn get(&self, key: String) -> Result<Option<String>> {
-        self.get(key).map_err(|e| e.into())
-    }
-
-    fn remove(&mut self, key: String) -> Result<()> {
-        self.remove(key)?;
-        Ok(())
-    }
-}
-
 fn main() -> Result<()> {
     eprintln!("CARGO_PKG_VERSION: {}", env!("CARGO_PKG_VERSION"));
     let args = Args::parse();
@@ -123,60 +83,146 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut engine: Box<dyn Engine> = match args.engine.as_str() {
-        "kvs" => Box::new(KvStore::open("./")?),
-        "sled" => Box::new(sled::open("./")?),
+    match args.engine.as_str() {
+        "kvs" => {
+            let mut server = KvsServer::new(args.addr, KvStore::open("./")?)?;
+            server.run()?;
+        }
+        "sled" => {
+            let mut server = KvsServer::new(args.addr, SledEngine::open("./")?)?;
+            server.run()?;
+        }
         _ => return Err(Error::msg("Unknown engine")),
     };
 
-    let listener = TcpListener::bind(args.addr)?;
-    loop {
-        let (stream, _) = listener.accept()?;
-        let mut buf_reader = BufReader::new(stream.try_clone()?);
-        let mut buf_writer = BufWriter::new(stream.try_clone()?);
-        let stream = Deserializer::from_reader(&mut buf_reader).into_iter::<Request>();
-        for request in stream {
-            let request = request?;
-            eprintln!("Received request: {:?}", request);
-            match request {
-                Request::Set { key, value } => match engine.set(key, value) {
-                    Ok(_) => {
-                        let response = Response::Ok;
-                        serde_json::to_writer(&mut buf_writer, &response)?;
-                        eprintln!("Sent response: {:?}", response);
-                    }
-                    Err(e) => {
-                        let response = Response::Err(e.to_string());
-                        serde_json::to_writer(&mut buf_writer, &response)?;
-                        eprintln!("Error setting key: {:?}", e);
-                    }
-                },
-                Request::Get { key } => match engine.get(key) {
-                    Ok(value) => {
-                        let response = Response::Value(value);
-                        serde_json::to_writer(&mut buf_writer, &response)?;
-                        eprintln!("Sent response: {:?}", response);
-                    }
-                    Err(e) => {
-                        let response = Response::Err(e.to_string());
-                        serde_json::to_writer(&mut buf_writer, &response)?;
-                        eprintln!("Error getting key: {:?}", e);
-                    }
-                },
-                Request::Remove { key } => match engine.remove(key) {
-                    Ok(_) => {
-                        let response = Response::Ok;
-                        serde_json::to_writer(&mut buf_writer, &response)?;
-                        eprintln!("Sent response: {:?}", response);
-                    }
-                    Err(e) => {
-                        let response = Response::Err(e.to_string());
-                        serde_json::to_writer(&mut buf_writer, &response)?;
-                        eprintln!("Error removing key: {:?}", e);
-                    }
-                },
-            }
-            buf_writer.flush().unwrap();
-        }
+    Ok(())
+}
+
+/// KVS 服务器
+pub struct KvsServer<E: KvsEngine> {
+    listener: TcpListener,
+    thread_pool: NaiveThreadPool,
+    engine: E,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl<E: KvsEngine> KvsServer<E> {
+    /// 创建新的 KVS 服务器
+    pub fn new(addr: String, engine: E) -> Result<Self> {
+        let cpus = num_cpus::get();
+        let thread_pool = NaiveThreadPool::new(cpus as u32)?;
+        let listener = TcpListener::bind(addr)?;
+        // 设置非阻塞模式以便能够检查关闭标志
+        listener.set_nonblocking(true)?;
+
+        Ok(Self {
+            listener,
+            thread_pool,
+            engine,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        })
     }
+
+    /// 运行服务器
+    pub fn run(&mut self) -> Result<()> {
+        eprintln!("Server started, waiting for connections...");
+
+        loop {
+            // 检查是否收到关闭信号
+            if self.shutdown.load(Ordering::Relaxed) {
+                eprintln!("Shutdown signal received, stopping server...");
+                break;
+            }
+
+            // 尝试接受新连接（非阻塞）
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    let engine = self.engine.clone();
+                    let shutdown = self.shutdown.clone();
+                    self.thread_pool.spawn(move || {
+                        // 在处理流时也检查关闭标志
+                        if !shutdown.load(Ordering::Relaxed) {
+                            if let Err(e) = handle_stream(stream, engine) {
+                                eprintln!("Error handling stream: {:?}", e);
+                            }
+                        }
+                    });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // 没有新连接，继续循环检查关闭标志
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => {
+                    // 其他错误
+                    if !self.shutdown.load(Ordering::Relaxed) {
+                        return Err(Error::from(e));
+                    }
+                    break;
+                }
+            }
+        }
+
+        eprintln!(
+            "Server stopped accepting new connections, waiting for active connections to finish..."
+        );
+        // 线程池会在 Drop 时等待所有任务完成
+        Ok(())
+    }
+
+    /// 关闭服务器
+    pub fn shutdown(&self) {
+        eprintln!("Shutting down server...");
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+}
+
+fn handle_stream(stream: TcpStream, engine: impl KvsEngine) -> Result<()> {
+    let mut buf_reader = BufReader::new(stream.try_clone()?);
+    let mut buf_writer = BufWriter::new(stream.try_clone()?);
+    let stream = Deserializer::from_reader(&mut buf_reader).into_iter::<Request>();
+    for request in stream {
+        let request = request?;
+        eprintln!("Received request: {:?}", request);
+        match request {
+            Request::Set { key, value } => match engine.set(key, value) {
+                Ok(_) => {
+                    let response = Response::Ok;
+                    serde_json::to_writer(&mut buf_writer, &response)?;
+                    eprintln!("Sent response: {:?}", response);
+                }
+                Err(e) => {
+                    let response = Response::Err(e.to_string());
+                    serde_json::to_writer(&mut buf_writer, &response)?;
+                    eprintln!("Error setting key: {:?}", e);
+                }
+            },
+            Request::Get { key } => match engine.get(key) {
+                Ok(value) => {
+                    let response = Response::Value(value);
+                    serde_json::to_writer(&mut buf_writer, &response)?;
+                    eprintln!("Sent response: {:?}", response);
+                }
+                Err(e) => {
+                    let response = Response::Err(e.to_string());
+                    serde_json::to_writer(&mut buf_writer, &response)?;
+                    eprintln!("Error getting key: {:?}", e);
+                }
+            },
+            Request::Remove { key } => match engine.remove(key) {
+                Ok(_) => {
+                    let response = Response::Ok;
+                    serde_json::to_writer(&mut buf_writer, &response)?;
+                    eprintln!("Sent response: {:?}", response);
+                }
+                Err(e) => {
+                    let response = Response::Err(e.to_string());
+                    serde_json::to_writer(&mut buf_writer, &response)?;
+                    eprintln!("Error removing key: {:?}", e);
+                }
+            },
+        }
+        buf_writer.flush().unwrap();
+    }
+    Ok(())
 }
